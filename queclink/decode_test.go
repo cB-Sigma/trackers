@@ -188,8 +188,8 @@ func TestServerAcknowledgement(t *testing.T) {
 	}
 }
 
-// Noise, line ends, unknown report types and HEX-format frames are passed
-// over with a warning; the frames around them are read.
+// Noise, line ends, unknown report types and HEX frames that do not
+// decode are passed over with a warning; the frames around them are read.
 //
 // Covers: SIG-IMP-024
 func TestLenientDecoding(t *testing.T) {
@@ -213,7 +213,7 @@ func TestLenientDecoding(t *testing.T) {
 			codes = append(codes, sk.Code)
 		}
 	}
-	if strings.Join(codes, " ") != "unknownMessage unknownCodec" {
+	if strings.Join(codes, " ") != "unknownMessage messageUnreadable" {
 		t.Fatalf("skip codes %v", codes)
 	}
 	// Known reports without values identify the device and record nothing.

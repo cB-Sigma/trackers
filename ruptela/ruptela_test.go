@@ -171,7 +171,7 @@ func TestEventsAndHistory(t *testing.T) {
 //
 // Covers: SIG-IMP-032
 func TestLenientParsing(t *testing.T) {
-	version := ruptela.DeviceFrame(356307042441013, 3, []byte("FM-Pro4 00.02.24"))
+	version := ruptela.DeviceFrame(356307042441013, 99, []byte("FM-Pro4 00.02.24")) // no such command
 	bad := h(docHeartbeat)
 	bad[len(bad)-1] ^= 0xFF
 	ms := decodeAll(t, "", version, bad, h(docHeartbeat))

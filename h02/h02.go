@@ -38,7 +38,15 @@
 // form whose last 13 bytes are not read) holding the 10-digit device
 // number, time and date, latitude and longitude as packed BCD, a nibble of
 // validity and hemisphere flags, speed (knots), course and the status word.
+// The Cantrack document's Y-model record starts with 'Y' (0x59) and has the
+// same 32-byte layout with two analog inputs (status analog1, analog2: a
+// fuel level is the tank capacity times analog1/analog2) in place of the
+// device number, and a user alarm flag and record number after the status
+// word; it names no device, so it is read once an earlier frame did.
 // Positions are not answered unless profile.ackPositions is set.
+//
+// Both documents' uplink types are read; the 'X' binary record some
+// firmware sends, which no document describes, is not.
 //
 // # Status word
 //
@@ -284,6 +292,15 @@ func (c *codec) Decode(r *bufio.Reader) (*track.Message, error) {
 			return c.text(r)
 		case '$':
 			return c.binary(r)
+		case 'Y':
+			// A Cantrack Y-model record, when the next 31 bytes are one;
+			// otherwise noise, and scanning goes on after the 'Y'.
+			if p, err := r.Peek(binShort - 1); err == nil && yRecord(p) {
+				buf := make([]byte, binShort)
+				buf[0] = 'Y'
+				_, _ = io.ReadFull(r, buf[1:])
+				return c.decodeY(buf)
+			}
 		}
 		// Line ends and noise between frames are passed over.
 	}
@@ -881,11 +898,7 @@ func (c *codec) binary(r *bufio.Reader) (*track.Message, error) {
 func (c *codec) decodeBinary(b []byte) (*track.Message, error) {
 	h := bcd(b)
 	id := h[2:12]
-	tm, dt := h[12:18], h[18:24]
-	latS := h[24:32]
-	lonS := h[34:43]
-	flags := b[21] & 0x0F
-	if !digits(id, 10) || !digits(tm, 6) || !digits(dt, 6) || !digits(latS, 8) || !digits(lonS, 9) || !digits(h[44:50], 6) {
+	if !digits(id, 10) || !recordDigits(h) {
 		return nil, &track.Skip{Warning: track.Warning{Code: "unknownPacket", Detail: h,
 			Msg: "A binary record that is not packed decimal was passed over."}}
 	}
@@ -894,6 +907,51 @@ func (c *codec) decodeBinary(b []byte) (*track.Message, error) {
 		m.Login = true
 		c.imei = id
 	}
+	return c.binaryRecord(m, b, id)
+}
+
+// recordDigits checks the packed-decimal fields that the '$' and 'Y'
+// records share (h is the record in hexadecimal).
+func recordDigits(h string) bool {
+	return digits(h[12:18], 6) && digits(h[18:24], 6) && digits(h[24:32], 8) && digits(h[34:43], 9) && digits(h[44:50], 6)
+}
+
+// yRecord tells whether p (the 31 bytes after a 'Y') is a Y-model record.
+func yRecord(p []byte) bool {
+	return len(p) == binShort-1 && recordDigits(bcd(append([]byte{'Y'}, p...)))
+}
+
+// decodeY decodes a Cantrack Y-model record ('Y' first): two analog inputs
+// in place of the id, the '$' record's fields, a user alarm flag and a
+// record number. It has no id; the connection's device is the one an
+// earlier frame named.
+func (c *codec) decodeY(b []byte) (*track.Message, error) {
+	if c.imei == "" {
+		return nil, &track.Skip{Warning: track.Warning{Code: "unknownDevice", Detail: bcd(b),
+			Msg: "A Y-model record came before any frame naming the device and was passed over."}}
+	}
+	m := &track.Message{IMEI: c.imei, Kind: "normal"}
+	m, err := c.binaryRecord(m, b, c.imei)
+	if err != nil {
+		return nil, err
+	}
+	st := m.Records[0].Status
+	st["analog1"] = int(b[1])<<8 | int(b[2])
+	st["analog2"] = int(b[3])<<8 | int(b[4])
+	st["userAlarmFlag"] = int(b[29])
+	st["recordNumber"] = int(b[31])
+	m.Reply = nil // the answer R12 names the device id, which this record lacks
+	return m, nil
+}
+
+// binaryRecord reads the time, position, speed, course and status word of
+// a '$' or 'Y' record into m.
+func (c *codec) binaryRecord(m *track.Message, b []byte, id string) (*track.Message, error) {
+	h := bcd(b)
+	tm, dt := h[12:18], h[18:24]
+	latS := h[24:32]
+	lonS := h[34:43]
+	flags := b[21] & 0x0F
 	lat, _ := coord(latS[:4]+"."+latS[4:], "N")
 	lon, _ := coord(lonS[:5]+"."+lonS[5:], "E")
 	if flags&0x04 == 0 {

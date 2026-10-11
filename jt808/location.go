@@ -134,6 +134,8 @@ func (l *Location) StatusValues() map[string]any {
 			st["gsm"] = int(v[0])
 		case id == 0x31, id == 0x04, id == 0x11, id == 0x12, id == 0x13:
 			// Satellites go in the fix; the alarm details in the alerts.
+		case id >= 0x64 && id <= 0x67 && safetyOK(id, v, st):
+			// Active safety items (safety.go).
 		default:
 			// An item this codec does not interpret (vendor items 0xE1
 			// to 0xFF among them) is kept as hexadecimal.
@@ -141,6 +143,11 @@ func (l *Location) StatusValues() map[string]any {
 		}
 	}
 	return st
+}
+
+func safetyOK(id byte, v []byte, st map[string]any) bool {
+	_, ok := safetyItem(id, v, st)
+	return ok
 }
 
 // alertsFor are the alerts of the alarm bits set in now but not in prev.

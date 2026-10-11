@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"time"
 )
 
 // Flag is the byte that opens and closes every frame.
@@ -193,7 +194,21 @@ func ReadFrame(r *bufio.Reader) (*Frame, error) {
 // Phone, ID and Serial are used; length and version bits are set from
 // the body and Version (never subpackaged).
 func Encode(h Header, body []byte) []byte {
-	props := uint16(len(body)) & propLength
+	h.Props, h.Total, h.Index = 0, 0, 0
+	return EncodeWith(h, body)
+}
+
+// PropRSA is the body attribute bit of an RSA-encrypted body (bit 10).
+const PropRSA = 0x0400
+
+// EncodeWith is Encode that also keeps the encryption bits of h.Props
+// (PropRSA) and, when h.Total is above 0, frames the body as piece
+// h.Index of h.Total of a subpackaged message.
+func EncodeWith(h Header, body []byte) []byte {
+	props := uint16(len(body))&propLength | h.Props&propEncrypt
+	if h.Total > 0 {
+		props |= propSubpacket
+	}
 	b := binary.BigEndian.AppendUint16(nil, h.ID)
 	if h.V2019() {
 		props |= propVersion
@@ -204,6 +219,10 @@ func Encode(h Header, body []byte) []byte {
 	}
 	b = append(b, h.Phone...)
 	b = binary.BigEndian.AppendUint16(b, h.Serial)
+	if h.Total > 0 {
+		b = binary.BigEndian.AppendUint16(b, h.Total)
+		b = binary.BigEndian.AppendUint16(b, h.Index)
+	}
 	b = append(b, body...)
 	b = append(b, Check(b))
 	out := append([]byte{Flag}, Escape(b)...)
@@ -256,3 +275,23 @@ func bcdFields(b []byte) ([6]int, bool) {
 
 // BCD encodes a number of two decimal digits.
 func BCD(v int) byte { return byte(v/10)<<4 | byte(v%10) }
+
+// BCDTime encodes t as BCD[6] YYMMDDhhmmss in zone loc; the zero time is
+// six zero bytes.
+func BCDTime(t time.Time, loc *time.Location) []byte {
+	if t.IsZero() {
+		return make([]byte, 6)
+	}
+	t = t.In(loc)
+	return []byte{BCD(t.Year() % 100), BCD(int(t.Month())), BCD(t.Day()), BCD(t.Hour()), BCD(t.Minute()), BCD(t.Second())}
+}
+
+// bcdTime reads a BCD[6] time in zone loc as UTC; ok is false for an
+// invalid or all-zero time.
+func bcdTime(b []byte, loc *time.Location) (time.Time, bool) {
+	v, ok := bcdFields(b)
+	if !ok || v[1] < 1 || v[1] > 12 || v[2] < 1 || v[2] > 31 || v[3] > 23 || v[4] > 59 || v[5] > 59 {
+		return time.Time{}, false
+	}
+	return time.Date(2000+v[0], time.Month(v[1]), v[2], v[3], v[4], v[5], 0, loc).UTC(), true
+}

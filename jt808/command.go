@@ -33,6 +33,8 @@ type planned struct {
 	text bool
 	// cut is the fuel line state a 0x8500 command asks for.
 	cut *bool
+	// plain is never encrypted (the key exchange).
+	plain bool
 }
 
 func (c *codec) v2019() bool {
@@ -46,6 +48,11 @@ func (c *codec) plan(imei string, content any) (*planned, error) {
 	n, named, err := track.ReadNamed(content)
 	if err != nil {
 		return nil, err
+	}
+	if m, ok := content.(map[string]any); ok && !named {
+		if _, isOp := m["op"]; isOp {
+			return c.planOp(m)
+		}
 	}
 	if !named {
 		text, err := track.CommandText(content)
@@ -142,10 +149,32 @@ func (c *codec) Command(imei string, content any, seq uint32) ([]byte, bool, err
 		return nil, false, err
 	}
 	h := c.header(imei, p.id, uint16(seq))
+	body := p.body
+	if k := c.terminalKey(fmt.Sprintf("%X", h.Phone)); k != nil && c.cfg.encrypt && !p.plain && len(body) > 0 {
+		if body, err = EncryptBody(k, body); err != nil {
+			return nil, false, err
+		}
+		if len(body) > propLength {
+			return nil, false, fmt.Errorf("the command is %d bytes encrypted, more than the 1023 a message holds; shorten it or set profile.encryptCommands false", len(body))
+		}
+		h.Props |= PropRSA
+	}
 	if p.cut != nil {
 		c.expect(fmt.Sprintf("%X", h.Phone), h.Serial, *p.cut)
 	}
-	return Encode(h, p.body), true, nil
+	if p.id == MPlaybackRequest || p.id == MResourceQuery {
+		c.listed(h.Serial, p.id)
+	}
+	return EncodeWith(h, body), true, nil
+}
+
+// answerSerial is the serial a command's answer names: 0 for those whose
+// answers name none (0x9003, 0x8A00).
+func answerSerial(id uint16, seq uint32) uint16 {
+	if id == MAVAttributesQuery || id == MPlatformRSA {
+		return 0
+	}
+	return uint16(seq)
 }
 
 // Correlation names the answer of a command: its message ID and serial,
@@ -157,7 +186,7 @@ func (c *codec) Correlation(content any, seq uint32) (string, bool) {
 	if err != nil {
 		return "", false
 	}
-	return correlation(p.id, uint16(seq)), !(p.text && c.cfg.awaitText)
+	return correlation(p.id, answerSerial(p.id, seq)), !(p.text && c.cfg.awaitText)
 }
 
 // expect notes the fuel line state a vehicle control command asks for.

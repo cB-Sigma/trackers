@@ -21,7 +21,9 @@
 //
 // Named commands (track.Named), Coban GPRS command letters: engineStop
 // "J", engineResume "K", locate "B", interval "C,<seconds>s" (10 to 86400
-// s). Coban has no reboot over GPRS.
+// s). No public GPS103/Coban command list (nor Traccar's GPS103 encoder)
+// gives a reboot over GPRS, so reboot has no default text; for firmware
+// that has one, set profile.namedCommands.reboot to its text.
 package tk103
 
 import (

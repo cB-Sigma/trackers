@@ -10,8 +10,8 @@ import (
 )
 
 // Named commands are Teltonika SMS/GPRS commands in Codec 12; the
-// interval has no default (a model's own parameter) and fails with the
-// reason until the profile gives it.
+// interval defaults to the FMB data-acquisition parameters and a profile
+// template replaces it (or turns it off) for other models.
 //
 // Covers: SIG-IMP-008
 func TestNamedCommandTexts(t *testing.T) {
@@ -25,8 +25,20 @@ func TestNamedCommandTexts(t *testing.T) {
 			t.Errorf("%s: %q %v", action, f, err)
 		}
 	}
-	if _, _, err := nc().Command("356307042441013", map[string]any{"action": "interval", "seconds": 60.0}, 1); !errors.Is(err, track.ErrUnsupported) {
-		t.Errorf("interval without a template: %v", err)
+	// The interval is FMB setparam of the data-acquisition "Min Period"
+	// parameters: on stop and moving, in the home, roaming and unknown
+	// networks.
+	f, _, err := nc().Command("356307042441013", map[string]any{"action": "interval", "seconds": 60.0}, 1)
+	if err != nil || string(f) != string(teltonika.Codec12Frame(teltonika.TypeCmd, "setparam 10000:60;10050:60;10100:60;10150:60;10200:60;10250:60")) {
+		t.Errorf("interval default: %q %v", f, err)
+	}
+	// A profile that turns it off answers unsupported.
+	off, err := teltonika.NewCodec(json.RawMessage(`{"namedCommands": {"interval": ""}}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := off().Command("356307042441013", map[string]any{"action": "interval", "seconds": 60.0}, 1); !errors.Is(err, track.ErrUnsupported) {
+		t.Errorf("interval turned off: %v", err)
 	}
 	nc, err = teltonika.NewCodec(json.RawMessage(`{"namedCommands": {"interval": "setparam 10050:{seconds}", "engineStop": "setdigout ?1"}}`))
 	if err != nil {

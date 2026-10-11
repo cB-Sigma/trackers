@@ -23,6 +23,15 @@
 // Their cells and access points are the record's track.Network, which a
 // server may turn into a position with a geolocation service.
 //
+// Further numbers (more.go): GPS only 0x10, the heartbeat 0x23 (answered),
+// alarms with a fence number 0x27 and with 4G cells 0xA3 0xA4, cell alarms
+// 0x19 and 0xA5 (answered), address requests 0x2A, 0x17 (with a length
+// byte) and 0xA7 (AddressReply builds the 0x97 answer), the 4G location
+// 0xA0 and cells 0xA1 (answered) and 0xA2, external device data 0x9B, and
+// the 0x7979 location and alarm 0x32 0x33 (answered). Alarm codes follow
+// the Concox GK310 document's table (0x01 to 0x23, 0xFE ACC on, 0xFF ACC
+// off). Any other number is passed over with the warning unknownPacket.
+//
 // The profile (NewCodec; Profile):
 //
 //	checkCrc: true         # default true; false accepts frames with a bad CRC (some firmware)
@@ -151,6 +160,21 @@ var defaultAlarms = map[byte]track.Alert{
 	0x04: {Type: "geofence-enter", Severity: track.Info},
 	0x05: {Type: "geofence-exit", Severity: track.Minor},
 	0x06: {Type: "over-speed", Severity: track.Minor},
+	// Further codes of the Concox GK310 document's alarm table.
+	0x09: {Type: "vibration", Severity: track.Minor},
+	0x0C: track.NewAlert("power-on", ""),
+	0x0E: {Type: "low-battery", Severity: track.Minor},
+	0x0F: {Type: "low-battery", Severity: track.Minor},
+	0x10: track.NewAlert("sim-changed", ""),
+	0x11: track.NewAlert("power-off", ""),
+	0x13: track.NewAlert("tamper", ""),
+	0x14: track.NewAlert("door-open", ""),
+	0x15: track.NewAlert("main-power-low", ""),
+	0x18: track.NewAlert("box-opened", ""),
+	0x19: {Type: "low-battery", Severity: track.Minor},
+	0x23: track.NewAlert("fall-down", ""),
+	0xFE: track.NewAlert("ignition-on", ""),
+	0xFF: track.NewAlert("ignition-off", ""),
 }
 
 type codec struct {
@@ -213,7 +237,7 @@ func readFrame(r *bufio.Reader, checkCRC, fromServer bool) (*Frame, error) {
 				return nil, err
 			}
 			n, lenBytes = int(l), []byte{l}
-			if p, err := r.Peek(1); err == nil && (p[0] == PWiFi || p[0] == PWiFi2) {
+			if p, err := r.Peek(1); err == nil && (p[0] == PWiFi || p[0] == PWiFi2) && !normalFrame(r, l, checkCRC) {
 				return readWiFiFrame(r, n, fromServer)
 			}
 		}
@@ -233,6 +257,23 @@ func readFrame(r *bufio.Reader, checkCRC, fromServer bool) (*Frame, error) {
 		}
 		return &Frame{Ext: ext, Protocol: body[0], Content: body[1 : n-4], Serial: binary.BigEndian.Uint16(body[n-4 : n-2])}, nil
 	}
+}
+
+// normalFrame tells a 0x17 frame with a length byte (the LBS address
+// request, or a server's Chinese address answer) from the count-in-header
+// WiFi frame of the same number: it ends with 0x0D0A where the length
+// says, and (when checked) its CRC matches. A WiFi frame is always longer
+// than that many bytes, so the look-ahead never waits for more data.
+func normalFrame(r *bufio.Reader, l byte, checkCRC bool) bool {
+	n := int(l)
+	if n < 5 {
+		return false
+	}
+	p, err := r.Peek(n + 2)
+	if err != nil || p[0] != PLBSAddress || p[n] != 0x0D || p[n+1] != 0x0A {
+		return false
+	}
+	return !checkCRC || track.CRCITU(append([]byte{l}, p[:n-2]...)) == binary.BigEndian.Uint16(p[n-2:n])
 }
 
 // Encode builds a frame (0x7878 unless the length needs 0x7979).
@@ -312,27 +353,23 @@ func (c *codec) message(f *Frame) (*track.Message, error) {
 		st["batteryLevel"], st["gsm"] = int(b[1]), int(b[2])
 		m.Records = []track.Record{{Status: st, Alerts: infoAlerts(b[0])}}
 		ack()
-	case PAlarm, PAlarm2:
+	case PAlarm, PAlarm2, PAlarmFences, P4GAlarm, P4GAlarmFences:
 		if len(b) < 18+1 {
 			return nil, short("alarm", f.Protocol, len(b))
 		}
 		rec := track.Record{Fix: c.gps(b[:6], b[6:18])}
 		rest := b[18:]
-		// The LBS block's first byte is its length, itself included.
+		// The LBS block's first byte is its length, itself included; the
+		// length tells a 2G cell from a 4G one (0xA3, 0xA4).
 		if l := int(rest[0]); l > 0 && len(rest) >= l {
+			if cell, ok := lbsBlock(rest[1:l]); ok {
+				rec.Network = &track.Network{Cells: []track.Cell{cell}}
+			}
 			rest = rest[l:]
 		}
-		if len(rest) >= 4 {
-			rec.Status = terminalInfo(rest[0])
-			rec.Status["batteryLevel"], rec.Status["gsm"] = int(rest[1]), int(rest[2])
-			if a, ok := c.cfg.alarms[rest[3]]; ok {
-				if a.Code == "" {
-					a.Code = fmt.Sprintf("0x%02X", rest[3])
-				}
-				rec.Alerts = append(rec.Alerts, a)
-			} else if rest[3] != 0 {
-				rec.Alerts = append(rec.Alerts, track.Alert{Type: fmt.Sprintf("alarm-0x%02X", rest[3]), Severity: track.Minor, Code: fmt.Sprintf("0x%02X", rest[3])})
-			}
+		c.alarmStatus(&rec, rest)
+		if (f.Protocol == PAlarmFences || f.Protocol == P4GAlarmFences) && len(rest) >= 6 {
+			rec.Status["geofenceId"] = int(rest[5])
 		}
 		m.Records = []track.Record{rec}
 		ack()
@@ -350,6 +387,9 @@ func (c *codec) message(f *Frame) (*track.Message, error) {
 		ack()
 	case PWiFi, PWiFi2:
 		if !f.CountHeader {
+			if f.Protocol == PLBSAddress {
+				return c.addressRequest(f, m)
+			}
 			return nil, track.ErrSkip
 		}
 		rec, err := c.wifi(f)
@@ -385,6 +425,12 @@ func (c *codec) message(f *Frame) (*track.Message, error) {
 		m.Response, m.Failed = &text, track.AnswerFailed(text, c.cfg.fail)
 		m.Correlation = flagCorrelation(binary.BigEndian.Uint32(b[0:4]))
 	default:
+		if ok, err := c.more(f, m); ok {
+			if err != nil {
+				return nil, err
+			}
+			return m, nil
+		}
 		// A protocol number this codec does not read (a vendor variant):
 		// passed over, the connection stays up.
 		return nil, &track.Skip{Warning: track.Warning{Code: "unknownPacket", Detail: fmt.Sprintf("0x%02X", f.Protocol),

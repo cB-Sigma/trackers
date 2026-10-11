@@ -15,12 +15,23 @@
 // its record extension byte), both acknowledged with command 100 (01
 // accepted, 00 refused); identification 15 and dynamic identification 18
 // (the login: device type, firmware, IMSI; acknowledged with 115);
-// heartbeat 16 (acknowledged with 116); diagnostic trouble codes 9
-// (acknowledged with 109); the text answer 7 to an SMS command sent over
-// GPRS, and the answer 17 to a set-IO-value command. Any other command is
-// skipped (track.Skip) with the warning unknownMessage. Records of a
-// packet whose "records left" flag is set are the device emptying its
-// memory, so they are marked as history.
+// heartbeat 16 (acknowledged with 116); diagnostic trouble codes 9 (one
+// record per code with its time, position, source and current or history;
+// acknowledged with 109); the text answer 7 to an SMS command sent over
+// GPRS, and the answer 17 to a set-IO-value command; the configuration (2),
+// version (3) and firmware update (4) answers; the transparent channel 14
+// (serial data, acknowledged with 114 on its port); weighing data 32 (a
+// record, acknowledged with 132); the Garmin status answer 30; SD card log
+// records 34 (history, acknowledged with 134); camera files 37 (a file's
+// packets are asked for one by one and reassembled; the last packet's
+// message carries it, PictureOf; file lists and delete answers are
+// answers). Beacon data 38 and accident reconstruction data 35 are
+// acknowledged and passed over with the warning unknownMessage. Passed over
+// without an answer, as they only follow server requests this codec does not
+// make or carry files a tracking server does not keep: tachograph 10, 11,
+// 12, smart card files 5, 6, 19, Garmin FMI data 31 and the fuel level
+// sensor channel 33. Records of a packet whose "records left" flag is set
+// are the device emptying its memory, so they are marked as history.
 //
 // IO elements become status values: 2-5 din1..din4 (5 is the ignition
 // input), 251 virtual ignition, 27 gsm, 29 externalVoltage (V), 30
@@ -45,6 +56,10 @@
 // every text command carries an ID tag the device echoes in its answer;
 // the codec is a track.Correlator, so a late answer cannot complete the
 // next command. The device's "Use ID in SMS commands" setting must match.
+// Binary commands of the protocol: {"getVersion": {}} (103),
+// {"setConnection": {"host", "port", "protocol"}} (105),
+// {"setOdometer": {"value": metres}} (106), {"photoList": {"source",
+// "from", "to"}} and {"photo": {"name", "source"}} (137).
 //
 // The profile (NewCodec; Profile):
 //
@@ -193,6 +208,7 @@ func NewCodec(raw json.RawMessage) (func() track.Codec, error) {
 type codec struct {
 	cfg  config
 	imei string
+	pic  *assembly // the camera file being received (37)
 }
 
 // ---- framing ----------------------------------------------------------------
@@ -320,10 +336,6 @@ func (c *codec) Decode(r *bufio.Reader) (*track.Message, error) {
 	case CmdHeartbeat:
 		m.Kind = "health"
 		m.Reply, m.Reject = ack(AckHeartbeat, 1), ack(AckHeartbeat, 0)
-	case CmdDTC:
-		m.Kind = "health"
-		m.Records = []track.Record{{Status: map[string]any{"dtc": fmt.Sprintf("%X", p)}, Time: time.Now()}}
-		m.Reply = ack(AckDTC, 1)
 	case CmdSMSAnswer:
 		text := string(p)
 		m.Kind = "response"
@@ -350,8 +362,9 @@ func (c *codec) Decode(r *bufio.Reader) (*track.Message, error) {
 		m.Response = &text
 		m.Details = map[string]any{"result": int(p[0])}
 	default:
-		return nil, &track.Skip{Warning: track.Warning{Code: "unknownMessage", Detail: fmt.Sprintf("command %d", cmd),
-			Msg: "A Ruptela packet of a command this codec does not read was passed over (the connection stays up)."}}
+		if err := c.more(cmd, p, m); err != nil {
+			return nil, err
+		}
 	}
 	return m, nil
 }
@@ -633,14 +646,15 @@ func (c *codec) Command(imei string, content any, seq uint32) ([]byte, bool, err
 // CommandWithPassword frames a command with the device's command password
 // ("" for the profile's password, if any).
 func (c *codec) CommandWithPassword(imei, password string, content any, seq uint32) ([]byte, bool, error) {
-	if m, ok := content.(map[string]any); ok {
-		if s, has := m["setIo"]; has {
-			id, v, err := readSetIO(s, len(m))
-			if err != nil {
-				return nil, false, err
-			}
-			return SetIOFrame(id, v), true, nil
+	if form, v, members, ok := binaryForm(content); ok {
+		if form != "setIo" {
+			return binaryCommand(form, v, members)
 		}
+		id, val, err := readSetIO(v, members)
+		if err != nil {
+			return nil, false, err
+		}
+		return SetIOFrame(id, val), true, nil
 	}
 	text, err := c.text(password, imei, content)
 	if err != nil {
@@ -718,10 +732,8 @@ func (c *codec) Correlation(content any, seq uint32) (string, bool) {
 	if !c.cfg.ids {
 		return "", false
 	}
-	if m, ok := content.(map[string]any); ok {
-		if _, has := m["setIo"]; has {
-			return "", false
-		}
+	if _, _, _, ok := binaryForm(content); ok {
+		return "", false
 	}
 	return c.tag(seq), false
 }

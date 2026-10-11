@@ -35,9 +35,19 @@
 //     series): each data packet becomes a record; a batch of more than one
 //     packet, or one sent while the device still holds cached records, is
 //     history.
-//   - CCC, an older binary batch with no public description: passed over
-//     with the warning meitrack.unknownMessage (configure the device for
-//     AAA reports).
+//   - CCC, the older binary batch (no public description; the layout
+//     Traccar's decoder reads, confirmed by its published packets): each
+//     52-byte record becomes a record, a batch of more than one is
+//     history, and the server confirms the count read with CCC,<n>. A CCC
+//     whose header does not hold together is passed over with the warning
+//     meitrack.unknownMessage.
+//   - D00 picture packets and the D01 picture list (MVT600, T1, T333, T3):
+//     a picture's packets are reassembled per connection, the next eight
+//     are asked for after every eighth, and the last packet's message
+//     carries the picture (PictureOf). The D01 list's names, which run on
+//     from packet to packet, are joined once every packet has come
+//     (Details "pictures"). An AAA report of event 39 names the picture
+//     taken (status picture); profile.fetchPictures asks for it at once.
 //   - Command answers: any other command type ("C01,OK", "A12,OK", the
 //     E91 version answer); the AAA report with event 34 is the answer to
 //     A10. Unknown command types are taken as answers, so a command the
@@ -80,6 +90,7 @@
 //	matchIdentifier: true          # default true; false lets an answer with another data identifier complete a command of its type
 //	namedCommands: {}              # replace a named command's text ({seconds} is in seconds), e.g. {reboot: "F00,1,1"}
 //	failureWords: [fail, error, invalid]   # default; an answer holding one fails the command
+//	fetchPictures: false           # default false; true asks for the picture an event-39 report names (D00,<name>,0)
 package meitrack
 
 import (
@@ -153,6 +164,9 @@ type Profile struct {
 	// FailureWords are the words (any case) that fail a command when its
 	// answer holds one (default fail, error, invalid).
 	FailureWords []string `json:"failureWords,omitempty"`
+	// FetchPictures (default false) answers an AAA report of event 39 (a
+	// picture taken) with D00,<name>,0, so the tracker sends the picture.
+	FetchPictures bool `json:"fetchPictures,omitempty"`
 }
 
 type config struct {
@@ -169,6 +183,7 @@ type config struct {
 	matchID  bool
 	named    track.NamedTemplates
 	fail     []string
+	fetch    bool
 }
 
 // NewCodec validates a profile (empty for the defaults) and returns a
@@ -179,7 +194,7 @@ func NewCodec(raw json.RawMessage) (func() track.Codec, error) {
 		return nil, err
 	}
 	c := config{crc: p.CheckCRC == nil || *p.CheckCRC, loc: time.UTC, ign: 3, analog: "raw", adBase: 16, relay: 1,
-		inverted: p.RelayInverted, speed: p.StopSpeed, confirm: p.ConfirmEvents,
+		inverted: p.RelayInverted, speed: p.StopSpeed, confirm: p.ConfirmEvents, fetch: p.FetchPictures,
 		matchID: p.MatchIdentifier == nil || *p.MatchIdentifier, named: p.NamedCommands, events: map[int]track.Alert{}}
 	if p.AnalogHex != nil && !*p.AnalogHex {
 		c.adBase = 10
@@ -281,6 +296,8 @@ var analogScales = map[string][3]float64{
 type codec struct {
 	cfg  config
 	imei string
+	pic  *assembly     // the picture being received (D00)
+	list *listAssembly // the picture list being received (D01)
 }
 
 // ---- framing ----------------------------------------------------------------
@@ -479,6 +496,9 @@ func (c *codec) message(f *Frame) (*track.Message, error) {
 			m.Kind = "emergency"
 		}
 		confirm()
+		if name, ok := rec.Status["picture"].(string); ok && c.cfg.fetch {
+			m.Reply = append(m.Reply, Encode(true, f.ID, f.IMEI, []byte(PictureRequest(name, 0)))...)
+		}
 	case "CCE":
 		recs, warns, err := c.cce(f.Data)
 		if err != nil {
@@ -488,14 +508,26 @@ func (c *codec) message(f *Frame) (*track.Message, error) {
 		m.Records, m.Warnings, m.Kind = recs, warns, "normal"
 		confirm()
 	case "CCC":
-		return nil, &track.Skip{Warning: track.Warning{Code: "unknownMessage", Detail: "CCC",
-			Msg: "A CCC report (an older binary batch with no public description) was passed over. Set the device to send AAA reports (Meitrack Manager, GPRS settings)."}}
+		recs, err := c.ccc(f.Data)
+		if err != nil {
+			return nil, &track.Skip{Warning: track.Warning{Code: "unknownMessage", Detail: "CCC: " + err.Error(),
+				Msg: "A CCC report (an older binary batch with no public description) whose header does not hold together was passed over. Set the device to send AAA reports (Meitrack Manager, GPRS settings)."}}
+		}
+		m.Records, m.Kind, m.Reply = recs, "normal", cccConfirm(f, len(recs))
+		for _, r := range recs {
+			if r.Status["event"] == 1 {
+				m.Kind = "emergency"
+			}
+		}
 	case "AFF":
 		// The answer to a confirmation (confirmEvents): nothing to keep.
 		m.Kind = "ack"
 	case "D00":
-		return nil, &track.Skip{Warning: track.Warning{Code: "unknownMessage", Detail: "D00",
-			Msg: "A picture packet (D00) was passed over; this codec does not store camera pictures."}}
+		if err := c.picturePacket(f, m); err != nil {
+			return nil, err
+		}
+	case "D01":
+		c.pictureList(f, m)
 	default:
 		typ, text := f.Type, f.Type
 		if len(f.Data) > 0 {
@@ -625,6 +657,10 @@ func (c *codec) aaa(s string) (track.Record, int, *track.Warning) {
 	case 37:
 		if extra != "" {
 			rec.Status["rfid"] = extra
+		}
+	case 39:
+		if extra != "" {
+			rec.Status["picture"] = extra
 		}
 	}
 	if v := get(19); len(v) == 4 {

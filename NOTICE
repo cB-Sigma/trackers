@@ -17,7 +17,7 @@ Traccar (https://github.com/traccar/traccar)
 Copyright Anton Tananaev and Traccar contributors
 Licensed under the Apache License, Version 2.0.
 
-No Traccar source code is included. Traccar was used in two ways:
+No Traccar source code is included. Traccar was used in three ways:
 
 1. Test data. Device packets published in Traccar's protocol decoder tests
    (src/test/java/org/traccar/protocol) are used, as protocol facts, as
@@ -37,12 +37,56 @@ No Traccar source code is included. Traccar was used in two ways:
      (fieldVectors).
    - osmand/decode_test.go: OsmAnd sample requests and older Traccar
      Client JSON bodies (OsmAndProtocolDecoderTest).
+   Added in v0.2.0:
+   - gt06/more_test.go: GT06 frames (0x10, 0x19, 0x23, 0x27, 0x2A, 0xA0 to
+     0xA5, 0x9B, 0x32, 0x33) from Gt06ProtocolDecoderTest.
+   - h02: frames quoted in Traccar's H02 tests.
+   - teltonika/codec7_test.go: GH codec 7 packets from
+     TeltonikaProtocolDecoderTest.
+   - queclink/hex_test.go: HEX frames from Gl200BinaryProtocolDecoderTest
+     and Gl200FrameDecoderTest.
+   - meitrack/vectors_test.go: CCC and D00 packets from
+     MeitrackProtocolDecoderTest.
+   - ruptela/vectors_test.go: the files packet and trouble-code payload
+     from RuptelaProtocolDecoderTest.
+   - jt808/ext_test.go: the 0x64 ADAS and a 0x66 frame from
+     Jt808ProtocolDecoderTest.
+   - ais140/traccar_test.go: every packet of ItsProtocolDecoderTest.
+   - wialon/wialon_test.go, galileosky/galileosky_test.go,
+     suntech/decode_test.go, calamp/calamp_test.go, atrack, eelink and
+     watch tests: device packets from WialonProtocolDecoderTest,
+     GalileoProtocolDecoderTest, SuntechProtocolDecoderTest,
+     CalAmpProtocolDecoderTest, AtrackProtocolDecoderTest,
+     AtrackFrameDecoderTest, EelinkProtocolDecoderTest,
+     EelinkProtocolEncoderTest, WatchProtocolDecoderTest,
+     WatchFrameDecoderTest and WatchProtocolEncoderTest.
 
-2. Reference reading for behaviour, without taking code: the H02 decoder
+2. Reference reading for facts, without taking code: the H02 decoder
    and encoder, the JT808 decoder and encoder ("huabao"), the OsmAnd
    decoder, and the Position and Device models whose JSON field names a
    Traccar server's position forwarding carries (osmand/json.go reads
-   them). PROVENANCE.md says what was taken from each.
+   them); for v0.2.0 also the GT06, Teltonika (codec 7), Queclink HEX,
+   Meitrack (CCC, D00), Ruptela, ITS, Galileo, Suntech, CalAmp, ATrack,
+   Eelink and Watch decoders. PROVENANCE.md says what was taken from each.
+
+3. Interop peer: the traccar/traccar:6.16.0 Docker image is run, unchanged,
+   by the tests of trackers-sim's interop module; nothing of it is
+   distributed.
+
+go-jt808
+--------
+
+cuteLittleDevil/go-jt808 (https://github.com/cuteLittleDevil/go-jt808),
+licensed under the MIT License. Its documentation and model files were
+read for the JT/T 808 active-safety and JT/T 1078 signalling layouts
+(facts); no code was used.
+
+Teltonika AVL ID list
+---------------------
+
+IO element IDs, units and multipliers in teltonika/ioelements.go are facts
+from Teltonika's public FMB AVL ID list (wiki.teltonika-gps.com); the names
+are our own.
 
 Traccar's web site also hosts manufacturers' protocol documents
 (traccar.org/protocol/...); those are the manufacturers' documents, cited
@@ -80,7 +124,9 @@ Trademarks
 ----------
 
 Concox, Jimi IoT, Teltonika, Queclink, Meitrack, Ruptela, HuaSunTeK,
-Cantrack, Sinotrack, Coban, Traccar and OsmAnd are trademarks or names of
+Cantrack, Sinotrack, Coban, Traccar, OsmAnd, Wialon and Gurtam,
+Galileosky, Suntech, CalAmp and LMU, ATrack, Eelink and SeTracker are
+trademarks or names of
 their owners. They are used here only to say which devices, protocols and
 software this code works with. AIS-140 is a standard published by ARAI
 (Automotive Research Association of India) under the Ministry of Road

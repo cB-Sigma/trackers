@@ -6,15 +6,21 @@
 // or 0x00, CRC-16/IBM over codec..count, answered with the number of
 // records accepted) and UDP (the codec is a track.DatagramCodec; packet ID
 // and AVL packet ID echoed in the acknowledgement), Codec 16 data (2-byte
-// IO IDs, generation type), Codec 13 timestamped device messages (the
-// status "message"), and Codec 12 or Codec 14 (IMEI-addressed; profile
-// commandCodec: 14) commands and answers over TCP. A Codec 14 "IMEI does
-// not match" answer fails the command.
+// IO IDs, generation type), Codec 7 data of the older GH devices (masked
+// fields, float coordinates, IO kept raw), Codec 13 and Codec 15
+// timestamped device messages (the status "message"; Codec 15 also
+// carries the IMEI, which must be the connection's), and Codec 12 or
+// Codec 14 (IMEI-addressed; profile commandCodec: 14) commands and answers
+// over TCP. A Codec 14 "IMEI does not match" answer fails the command.
+// Packets in other codecs are read whole and passed over with a warning.
 //
 // GPS elements become the fix; IO elements become status values (239
 // ignition, 240 movement, 21 gsm, 66 externalVoltage, 67 batteryVoltage,
 // 113 batteryLevel, 69 gnssStatus, 181 pdop, 182 hdop, 16 odometer, 1
-// din1, 179 dout1) plus every raw element under "io". A record's event IO
+// din1, 179 dout1) plus every raw element under "io". With profile
+// ioNames every element of the FMB AVL ID table (IOName, IOElements) is
+// added under its name, scaled and signed; the default keys and the "io"
+// map stay as they are. A record's event IO
 // element and priority become alerts: priority 2 (panic) emergency; 253
 // harsh acceleration, braking or cornering; 255 over-speed; 252 main power
 // removed or restored; 247 impact; 246 towing; 249 and 318 GNSS jamming;
@@ -24,15 +30,19 @@
 //
 //	checkCrc: true         # default true; a frame with a bad CRC is not acknowledged, so the device resends
 //	io: {"78": iButton}    # extra IO id → status name
+//	ioNames: true          # default false; adds every known IO element by name
 //	commandCodec: 12       # default 12; 14 sends IMEI-addressed commands
 //	failureWords: [error, unknown, fail]   # default; an answer holding one fails the command
 //	namedCommands: {engineStop: "setdigout ?1"}   # replaces a named command's text
 //
 // Named commands (track.Named) are SMS/GPRS command texts in Codec 12 or
 // 14: engineStop "setdigout 1" (DOUT1 on), engineResume "setdigout 0",
-// locate "getrecord" (a high-priority record now), reboot "cpureset". The
-// reporting interval is a model's own parameter (setparam <id>:<value>)
-// and has no default: set namedCommands.interval for the model.
+// locate "getrecord" (a high-priority record now), reboot "cpureset",
+// interval "setparam 10000:{seconds};10050:{seconds};10100:{seconds};
+// 10150:{seconds};10200:{seconds};10250:{seconds}" (the FMB data
+// acquisition "Min Period" on stop and moving, in the home, roaming and
+// unknown networks). Models with other parameter IDs or narrower ranges
+// set namedCommands.interval.
 //
 // Commands: {"text": "getinfo"} (any SMS/GPRS command) as Codec 12; the
 // answer is the message's Response. A Codec 12 or 14 answer does not name
@@ -49,6 +59,7 @@ import (
 	"fmt"
 	"io"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/cB-Sigma/trackers/track"
@@ -62,6 +73,8 @@ const (
 	Codec13  = 0x0D // device message with a timestamp (one way)
 	Codec14  = 0x0E // IMEI-addressed command and answer
 	Codec16  = 0x10 // AVL data with 2-byte IO IDs and a generation type
+	Codec15  = 0x0F // device message with a timestamp and the IMEI (one way)
+	Codec7   = 0x07 // AVL data of the GH devices: masked fields
 	TypeCmd  = 0x05
 	TypeResp = 0x06
 	// TypeNotMine is a Codec 14 answer: the command's IMEI is not the
@@ -73,6 +86,10 @@ const (
 type Profile struct {
 	CheckCRC *bool             `json:"checkCrc,omitempty"`
 	IO       map[string]string `json:"io,omitempty"`
+	// IONames adds every element of the IO element table to the status
+	// under its name (IOName), scaled and signed, alongside the default
+	// keys and the raw "io" map.
+	IONames bool `json:"ioNames,omitempty"`
 	// CommandCodec is 12 (default) or 14 (the command carries the IMEI and
 	// a device with another IMEI refuses it).
 	CommandCodec int      `json:"commandCodec,omitempty"`
@@ -89,6 +106,7 @@ type config struct {
 	cmd14 bool
 	fail  []string
 	named track.NamedTemplates
+	names bool
 }
 
 // NewCodec validates a profile (empty for the defaults) and returns a
@@ -98,7 +116,7 @@ func NewCodec(raw json.RawMessage) (func() track.Codec, error) {
 	if err := track.StrictJSON(raw, &p); err != nil {
 		return nil, err
 	}
-	c := config{crc: p.CheckCRC == nil || *p.CheckCRC, io: map[uint16]string{}}
+	c := config{crc: p.CheckCRC == nil || *p.CheckCRC, io: map[uint16]string{}, names: p.IONames}
 	switch p.CommandCodec {
 	case 0, 12:
 	case 14:
@@ -188,7 +206,7 @@ func (c *codec) Decode(r *bufio.Reader) (*track.Message, error) {
 	data = data[:n]
 	m := &track.Message{IMEI: c.imei}
 	switch data[0] {
-	case Codec8, Codec8E, Codec16:
+	case Codec8, Codec8E, Codec16, Codec7:
 		recs, err := c.records(data)
 		if err != nil {
 			// The packet was read whole, so the stream stays in step; it is
@@ -217,6 +235,18 @@ func (c *codec) Decode(r *bufio.Reader) (*track.Message, error) {
 				Msg: "A Teltonika text message that could not be read was passed over (the connection stays up)."}}
 		}
 		// Not a command's answer: only the status records it.
+		m.Records = []track.Record{{Status: map[string]any{"message": text}, Time: at}}
+	case Codec15:
+		// Codec 13 with the device's IMEI; one way as well.
+		text, at, imei, err := ParseCodec15(data)
+		if err != nil {
+			return nil, &track.Skip{Warning: track.Warning{Code: "messageUnreadable", Detail: err.Error(),
+				Msg: "A Teltonika text message that could not be read was passed over (the connection stays up)."}}
+		}
+		if strings.TrimLeft(imei, "0") != strings.TrimLeft(c.imei, "0") {
+			return nil, &track.Skip{Warning: track.Warning{Code: "imeiMismatch", Detail: imei,
+				Msg: "A Teltonika Codec 15 message naming another device's IMEI than the connection's was passed over."}}
+		}
 		m.Records = []track.Record{{Status: map[string]any{"message": text}, Time: at}}
 	case Codec14:
 		text, typ, err := ParseCodec14(data)
@@ -259,6 +289,113 @@ func ParseCodec13(d []byte) (string, time.Time, error) {
 	return string(d[11 : 7+n]), at, nil
 }
 
+// ParseCodec15 reads a Codec 15 data field: quantity, type, size (the
+// timestamp's 4 bytes, the IMEI's 8 and the text), a Unix timestamp in
+// seconds, the IMEI as 8 BCD bytes, the text and the quantity again. It
+// returns the text, the time and the IMEI's digits without leading zeros.
+func ParseCodec15(d []byte) (text string, at time.Time, imei string, err error) {
+	if len(d) < 20 || d[0] != Codec15 {
+		return "", time.Time{}, "", errors.New("teltonika: not a Codec 15 message")
+	}
+	n := int(binary.BigEndian.Uint32(d[3:7]))
+	if n < 12 || 7+n+1 > len(d) {
+		return "", time.Time{}, "", errors.New("teltonika: Codec 15 size overruns the packet or misses the timestamp and IMEI")
+	}
+	at = time.Unix(int64(binary.BigEndian.Uint32(d[7:11])), 0).UTC()
+	imei, err = bcdIMEI(d[11:19])
+	if err != nil {
+		return "", time.Time{}, "", err
+	}
+	return string(d[19 : 7+n]), at, imei, nil
+}
+
+// Codec15Frame builds a Codec 15 device message (TCP) of the given type
+// (the device's configured message type; Teltonika's example uses 0x0B).
+func Codec15Frame(imei string, typ byte, at time.Time, text string) ([]byte, error) {
+	id, err := imeiBCD(imei)
+	if err != nil {
+		return nil, err
+	}
+	d := []byte{Codec15, 0x01, typ}
+	d = binary.BigEndian.AppendUint32(d, uint32(12+len(text)))
+	d = binary.BigEndian.AppendUint32(d, uint32(at.Unix()))
+	d = append(d, id[:]...)
+	d = append(d, text...)
+	return frame(append(d, 0x01)), nil
+}
+
+// Codec13Frame builds a Codec 13 device message (TCP): type 0x06, the
+// time in seconds and the text.
+func Codec13Frame(at time.Time, text string) []byte {
+	d := []byte{Codec13, 0x01, TypeResp}
+	d = binary.BigEndian.AppendUint32(d, uint32(4+len(text)))
+	d = binary.BigEndian.AppendUint32(d, uint32(at.Unix()))
+	d = append(d, text...)
+	return frame(append(d, 0x01))
+}
+
+// Codec14Message builds a Codec 14 message (TCP) of any type: TypeCmd,
+// a device's TypeResp answer with the text, or TypeNotMine with none.
+func Codec14Message(imei string, typ byte, text string) ([]byte, error) {
+	id, err := imeiBCD(imei)
+	if err != nil {
+		return nil, err
+	}
+	d := []byte{Codec14, 0x01, typ}
+	d = binary.BigEndian.AppendUint32(d, uint32(8+len(text)))
+	d = append(d, id[:]...)
+	d = append(d, text...)
+	return frame(append(d, 0x01)), nil
+}
+
+// frame wraps a data field with the zero preamble, its length and CRC.
+func frame(d []byte) []byte {
+	out := make([]byte, 4, 12+len(d))
+	out = binary.BigEndian.AppendUint32(out, uint32(len(d)))
+	out = append(out, d...)
+	return binary.BigEndian.AppendUint32(out, uint32(track.CRC16IBM(d)))
+}
+
+// imeiBCD packs up to 16 IMEI digits as 8 BCD bytes, zero-filled on the left.
+func imeiBCD(imei string) ([8]byte, error) {
+	var id [8]byte
+	digits := fmt.Sprintf("%016s", imei)
+	if len(digits) != 16 {
+		return id, fmt.Errorf("teltonika: IMEI %q is longer than 16 digits", imei)
+	}
+	for i := 0; i < 8; i++ {
+		hi, lo := digits[2*i]-'0', digits[2*i+1]-'0'
+		if hi > 9 || lo > 9 {
+			return id, fmt.Errorf("teltonika: IMEI %q is not digits", imei)
+		}
+		id[i] = hi<<4 | lo
+	}
+	return id, nil
+}
+
+// bcdIMEI reads 8 BCD bytes as IMEI digits without leading zeros.
+func bcdIMEI(b []byte) (string, error) {
+	s := fmt.Sprintf("%X", b)
+	for _, c := range s {
+		if c > '9' {
+			return "", fmt.Errorf("teltonika: IMEI field %s is not BCD digits", s)
+		}
+	}
+	if t := strings.TrimLeft(s, "0"); t != "" {
+		return t, nil
+	}
+	return "0", nil
+}
+
+// ParseCodec14IMEI returns the IMEI of a Codec 14 data field (a command
+// or an answer), without leading zeros.
+func ParseCodec14IMEI(d []byte) (string, error) {
+	if len(d) < 15 || d[0] != Codec14 || binary.BigEndian.Uint32(d[3:7]) < 8 {
+		return "", errors.New("teltonika: Codec 14 message without an IMEI")
+	}
+	return bcdIMEI(d[7:15])
+}
+
 // ParseCodec14 reads a Codec 14 data field: quantity, type, size (the
 // IMEI's 8 bytes plus the text), the IMEI as 8 BCD bytes, the text and the
 // quantity again. It returns the text and the type.
@@ -279,27 +416,7 @@ func ParseCodec14(d []byte) (string, byte, error) {
 // Codec14Frame builds a Codec 14 command (TCP) for the device with this
 // IMEI: the IMEI goes as 8 bytes of BCD with a leading zero digit.
 func Codec14Frame(imei, text string) ([]byte, error) {
-	digits := fmt.Sprintf("%016s", imei)
-	if len(digits) != 16 {
-		return nil, fmt.Errorf("teltonika: IMEI %q is longer than 16 digits", imei)
-	}
-	var id [8]byte
-	for i := 0; i < 8; i++ {
-		hi, lo := digits[2*i]-'0', digits[2*i+1]-'0'
-		if hi > 9 || lo > 9 {
-			return nil, fmt.Errorf("teltonika: IMEI %q is not digits", imei)
-		}
-		id[i] = hi<<4 | lo
-	}
-	d := []byte{Codec14, 0x01, TypeCmd}
-	d = binary.BigEndian.AppendUint32(d, uint32(8+len(text)))
-	d = append(d, id[:]...)
-	d = append(d, text...)
-	d = append(d, 0x01)
-	out := make([]byte, 4, 12+len(d))
-	out = binary.BigEndian.AppendUint32(out, uint32(len(d)))
-	out = append(out, d...)
-	return binary.BigEndian.AppendUint32(out, uint32(track.CRC16IBM(d))), nil
+	return Codec14Message(imei, TypeCmd, text)
 }
 
 // ParseCodec12 reads a Codec 12 data field (codec..count2) and returns
@@ -394,6 +511,9 @@ func (r *rd) u64() uint64 { return binary.BigEndian.Uint64(r.take(8)) }
 func (c *codec) records(d []byte) ([]track.Record, error) {
 	r := &rd{b: d}
 	codecID := byte(r.u8())
+	if codecID == Codec7 {
+		return records7(r)
+	}
 	if codecID != Codec8 && codecID != Codec8E && codecID != Codec16 {
 		return nil, fmt.Errorf("teltonika: codec 0x%02X is not an AVL codec", codecID)
 	}
@@ -427,6 +547,8 @@ func (c *codec) records(d []byte) ([]track.Record, error) {
 		}
 		cntw() // total count
 		ios := map[uint16]uint64{}
+		sizes := map[uint16]int{}
+		vars := map[uint16][]byte{}
 		raw := map[string]any{}
 		for _, size := range []int{1, 2, 4, 8} {
 			cnt := int(cntw())
@@ -444,6 +566,7 @@ func (c *codec) records(d []byte) ([]track.Record, error) {
 					v = r.u64()
 				}
 				ios[id] = v
+				sizes[id] = size
 				raw[strconv.Itoa(int(id))] = v
 			}
 		}
@@ -452,7 +575,9 @@ func (c *codec) records(d []byte) ([]track.Record, error) {
 			for j := 0; j < cnt && r.err == nil; j++ {
 				id := r.u16()
 				l := int(r.u16())
-				raw[strconv.Itoa(int(id))] = fmt.Sprintf("%X", r.take(l))
+				b := r.take(l)
+				vars[uint16(id)] = b
+				raw[strconv.Itoa(int(id))] = fmt.Sprintf("%X", b)
 			}
 		}
 		st := map[string]any{"io": raw, "priority": int(prio)}
@@ -464,17 +589,33 @@ func (c *codec) records(d []byte) ([]track.Record, error) {
 		}
 		for id, v := range ios {
 			name, ok := c.cfg.io[id]
+			e, listed := ioTable[id]
+			if !ok && c.cfg.names && listed {
+				name, ok = e.Name, true
+			}
 			if !ok {
 				continue
 			}
-			def := knownIO[id]
+			def, isDefault := knownIO[id]
 			switch {
+			case !isDefault && c.cfg.names && listed:
+				st[name] = e.value(v, sizes[id])
 			case def.div < 0:
 				st[name] = v != 0
 			case def.div > 0:
 				st[name] = float64(v) / def.div
 			default:
 				st[name] = v
+			}
+		}
+		for id, b := range vars {
+			name, ok := c.cfg.io[id]
+			e, listed := ioTable[id]
+			if !ok && c.cfg.names && listed {
+				name, ok = e.Name, true
+			}
+			if ok {
+				st[name] = e.bytesValue(b)
 			}
 		}
 		if h, ok := st["hdop"].(float64); ok {

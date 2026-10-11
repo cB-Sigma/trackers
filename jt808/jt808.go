@@ -27,8 +27,19 @@
 // and 0x0500 (answers to a location query and to vehicle control, with a
 // location); 0x0001 terminal general response; 0x6006 text and 0x0900
 // pass-through answers as Jimi devices send them. Subpackaged messages
-// are joined. Any other message is acknowledged and passed over with a
-// warning.
+// are joined. Registrations in the JT/T 808-2011 layout (an 8-byte model
+// field) are told from 2013 ones by their length; the record's
+// protocolVersion says which. Active safety (safety.go): location items
+// 0x64 ADAS, 0x65 DSM, 0x66 tyre pressure and 0x67 blind spot become
+// alerts (code "0x64-0x04#11": item, alarm type, alarm ID) and status
+// values with the alarm label; 0x1210, 0x1211 and 0x1212 attachment
+// messages are read and answered (0x8001, 0x8001, 0x9212); attachment
+// data packets are passed over. JT/T 1078 signalling (video.go): 0x1003
+// attributes and 0x1205 resource lists are read as command answers. RSA
+// (rsa.go): 0x0A00 keeps the terminal's key and is answered 0x8A00, and
+// RSA bodies are decrypted with profile.rsaPrivateKey; other encryption,
+// or RSA without the key, is answered "not supported". Any other message
+// is acknowledged and passed over with a warning.
 //
 // Commands (command.go): {"text": "RELAY,1#"} is sent as 0x8300 text
 // (Jimi devices take their SMS commands this way), or as 0x8900
@@ -44,6 +55,22 @@
 // status disagrees); an answer naming another command does not complete
 // this one.
 //
+// Own-form commands ({"op": ...}, Ops): avAttributes (0x9003, answered
+// 0x1003), live (0x9101: server, tcpPort, udpPort, channel, data av,
+// video, talk, listen, broadcast or passThrough, stream main or sub),
+// liveControl (0x9102: channel, control close, switchStream, pause,
+// resume or closeTalk, close all, audio or video, stream), playback
+// (0x9201: server, ports, channel, media av, audio, video or any, stream
+// any, main or sub, storage any, main or backup, mode normal,
+// fastForward, rewind, keyFrames or singleFrame, speed 1 to 16, start
+// and end as RFC 3339 times), playbackControl (0x9202: channel, control
+// start, pause, stop, fastForward, rewind, seek or keyFrames, speed, at),
+// listResources (0x9205: channel, start, end, alarms, media, stream,
+// storage; answered 0x1205), attachmentUpload (0x9208: server, ports,
+// alarmLabel in hexadecimal as the location item gave it, alarmNumber)
+// and rsaKey (0x8A00 with the platform key, answered 0x0A00). Commands to
+// a terminal whose RSA key is known are encrypted (encryptCommands).
+//
 // The profile (NewCodec; Profile):
 //
 //	checkCrc: true             # default true; false accepts frames whose XOR check code does not match
@@ -55,11 +82,14 @@
 //	awaitTextAnswer: false     # default false; true completes a text command with the device's text answer instead of its 0x0001
 //	namedCommands: {reboot: "RESET#"}   # send a named command as this text instead (placeholders {seconds}, {imei})
 //	failureWords: [error, fail, invalid]   # default; a text answer holding one fails the command
+//	rsaPrivateKey: "-----BEGIN RSA PRIVATE KEY-----..."   # platform RSA key (PEM); reads RSA bodies, answers 0x0A00 with 0x8A00
+//	encryptCommands: true      # default true; commands to a terminal whose RSA key is known are encrypted
 package jt808
 
 import (
 	"bufio"
 	"crypto/rand"
+	"crypto/rsa"
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
@@ -140,6 +170,15 @@ type Profile struct {
 	// FailureWords are the words (any case) whose presence in a text
 	// answer fails the command (default error, fail, invalid).
 	FailureWords []string `json:"failureWords,omitempty"`
+	// RSAPrivateKey is the platform's RSA private key (PEM, PKCS #1 or
+	// PKCS #8). With it, RSA-encrypted bodies are decrypted, a terminal's
+	// 0x0A00 is answered with the platform public key (0x8A00) and the
+	// rsaKey command sends it. Without it encrypted bodies are answered
+	// "not supported".
+	RSAPrivateKey string `json:"rsaPrivateKey,omitempty"`
+	// EncryptCommands (default true) encrypts commands to a terminal whose
+	// public key (0x0A00) is known.
+	EncryptCommands *bool `json:"encryptCommands,omitempty"`
 }
 
 // Interval bounds the interval command (0x8103 parameter 0x0029, seconds).
@@ -158,14 +197,17 @@ type config struct {
 	awaitText  bool
 	named      track.NamedTemplates
 	fail       []string
+	key        *rsa.PrivateKey
+	encrypt    bool
 	sh         *shared
 }
 
 // shared is the state of every codec one NewCodec call makes.
 type shared struct {
 	mu     sync.Mutex
-	codes  map[string]string // phone (no leading zeros) → issued authentication code
-	engine map[string]bool   // phone#serial of a 0x8500 command → fuel line cut expected
+	codes  map[string]string         // phone (no leading zeros) → issued authentication code
+	engine map[string]bool           // phone#serial of a 0x8500 command → fuel line cut expected
+	keys   map[string]*rsa.PublicKey // phone (no leading zeros) → terminal RSA public key
 }
 
 // NewCodec reads a Profile (empty for the defaults) and returns the maker
@@ -178,7 +220,15 @@ func NewCodec(raw json.RawMessage) (func() track.Codec, error) {
 		return nil, err
 	}
 	c := &config{crc: p.CheckCRC == nil || *p.CheckCRC, strictAuth: p.StrictAuth, awaitText: p.AwaitTextAnswer, textFlag: 1,
-		named: p.NamedCommands, sh: &shared{codes: map[string]string{}, engine: map[string]bool{}}}
+		named: p.NamedCommands, encrypt: p.EncryptCommands == nil || *p.EncryptCommands,
+		sh: &shared{codes: map[string]string{}, engine: map[string]bool{}, keys: map[string]*rsa.PublicKey{}}}
+	if p.RSAPrivateKey != "" {
+		k, err := parsePrivateKey(p.RSAPrivateKey)
+		if err != nil {
+			return nil, err
+		}
+		c.key = k
+	}
 	loc, err := zone(p.Timezone)
 	if err != nil {
 		return nil, err
@@ -249,6 +299,8 @@ type codec struct {
 	prevHist   uint32
 	prevACC    *bool
 	parts      map[uint16]*parts
+	lists      map[uint16]uint16 // serial of a 0x9201 or 0x9205 → its ID
+	lastFile   string
 }
 
 // parts collects the pieces of a subpackaged message.
@@ -290,6 +342,9 @@ func skip(code, msg, detail string) error {
 const maxBody = 256 << 10
 
 func (c *codec) Decode(r *bufio.Reader) (*track.Message, error) {
+	if ok, err := c.skipFileData(r); ok {
+		return nil, err
+	}
 	raw, err := readRaw(r, c.afterFrame)
 	c.afterFrame = false
 	if errors.Is(err, errTooLong) {
@@ -312,10 +367,20 @@ func (c *codec) Decode(r *bufio.Reader) (*track.Message, error) {
 	c.mu.Unlock()
 	m := &track.Message{IMEI: f.PhoneDigits()}
 	if f.Props&propEncrypt != 0 {
-		m.Reply = c.general(f, ResultUnsupported)
-		m.Warnings = append(m.Warnings, track.Warning{Code: "unknownMessage", Detail: fmt.Sprintf("0x%04X encrypted", f.ID),
-			Msg: "An encrypted message was answered as not supported and passed over; this codec reads only unencrypted bodies. Turn encryption off on the device."})
-		return m, nil
+		if f.Props&propEncrypt != PropRSA || c.cfg.key == nil {
+			m.Reply = c.general(f, ResultUnsupported)
+			m.Warnings = append(m.Warnings, track.Warning{Code: "unknownMessage", Detail: fmt.Sprintf("0x%04X encrypted", f.ID), Setting: "profile.rsaPrivateKey",
+				Msg: "An encrypted message was answered as not supported and passed over. RSA bodies are read with profile.rsaPrivateKey set; other encryption is not read: turn it off on the device."})
+			return m, nil
+		}
+		body, err := DecryptBody(c.cfg.key, f.Body)
+		if err != nil {
+			m.Reply = c.general(f, ResultBadMessage)
+			m.Warnings = append(m.Warnings, track.Warning{Code: "decryptFailed", Detail: fmt.Sprintf("0x%04X: %v", f.ID, err), Setting: "profile.rsaPrivateKey",
+				Msg: "An RSA-encrypted message could not be decrypted with the platform key and was answered as a message error. Check that the terminal holds the platform public key of profile.rsaPrivateKey."})
+			return m, nil
+		}
+		f.Body = body
 	}
 	if f.Props&propSubpacket != 0 && f.Total > 1 {
 		body, done := c.join(f)
@@ -364,7 +429,9 @@ func (c *codec) message(f *Frame, m *track.Message) (*track.Message, error) {
 	b := f.Body
 	gated := c.cfg.strictAuth && !c.authed
 	switch f.ID {
-	case MRegister, MAuth, MHeartbeat, MLogout, MTerminalResponse:
+	case MRegister, MAuth, MHeartbeat, MLogout, MTerminalResponse,
+		// The attachment server's connection does not authenticate.
+		MAlarmAttachments, MFileInfo, MFileDone:
 	default:
 		if gated {
 			m.Reply = c.general(f, ResultFailure)
@@ -377,6 +444,9 @@ func (c *codec) message(f *Frame, m *track.Message) (*track.Message, error) {
 	case MRegister:
 		m.Login, m.Kind = true, "login"
 		st := registration(b, f.V2019())
+		if len(st) == 0 {
+			m.Warnings = append(m.Warnings, short(f, fmt.Errorf("a registration of %d bytes fits no layout", len(b))))
+		}
 		code := c.issue(f.PhoneDigits())
 		body := binary.BigEndian.AppendUint16(nil, f.Serial)
 		m.Reply = c.reply(MRegisterAnswer, append(append(body, 0), code...))
@@ -488,6 +558,16 @@ func (c *codec) message(f *Frame, m *track.Message) (*track.Message, error) {
 		m.Response, m.Failed = &text, res != ResultOK
 		m.Correlation = correlation(id, serial)
 		m.Details = map[string]any{"result": int(res), "answerTo": fmt.Sprintf("0x%04X", id)}
+		if id == MAVAttributesQuery || id == MPlatformRSA {
+			// Their own answers (0x1003, 0x0A00) name no serial.
+			m.Correlation = correlation(id, 0)
+		}
+	case MTerminalRSA:
+		c.terminalRSA(f, m)
+	case MAVAttributes, MResourceList:
+		c.videoMessage(f, m)
+	case MAlarmAttachments, MFileInfo, MFileDone:
+		c.attachmentMessage(f, m)
 	case MTextReport:
 		m.Kind = "response"
 		m.Reply = c.general(f, ResultOK)
@@ -561,11 +641,11 @@ func (c *codec) record(b []byte, history bool) (*track.Record, error) {
 	fx := l.Fix
 	rec := &track.Record{Fix: &fx, Status: l.StatusValues(), History: history, Time: fx.Time}
 	if history {
-		rec.Alerts = l.alertsFor(c.prevHist)
+		rec.Alerts = append(l.alertsFor(c.prevHist), l.SafetyAlerts()...)
 		c.prevHist = l.Alarm
 		return rec, nil
 	}
-	rec.Alerts = l.alertsFor(c.prevAlarm)
+	rec.Alerts = append(l.alertsFor(c.prevAlarm), l.SafetyAlerts()...)
 	c.prevAlarm = l.Alarm
 	acc := l.Status&StACC != 0
 	if c.prevACC != nil && *c.prevACC != acc {
@@ -584,16 +664,17 @@ func (c *codec) record(b []byte, history bool) (*track.Record, error) {
 func registration(b []byte, v2019 bool) map[string]any {
 	st := map[string]any{}
 	var maker, model, id int
-	switch {
-	case v2019 && len(b) >= 76:
+	switch registrationLayout(b, v2019) {
+	case "2019":
 		maker, model, id = 11, 30, 30
-	case !v2019 && len(b) >= 37:
+	case "2013":
 		maker, model, id = 5, 20, 7
-	case !v2019 && len(b) >= 25:
+	case "2011":
 		maker, model, id = 5, 8, 7
 	default:
 		return st
 	}
+	st["protocolVersion"] = registrationLayout(b, v2019)
 	p := 4
 	st["manufacturer"] = gbkText(b[p : p+maker])
 	p += maker
@@ -606,6 +687,30 @@ func registration(b []byte, v2019 bool) map[string]any {
 		st["plate"] = gbkText(b[p+1:])
 	}
 	return st
+}
+
+// plateColors are the plate colour codes (JT/T 415: 1 blue, 2 yellow, 3
+// black, 4 white, 9 other; 0 for a vehicle without a plate, and 5 green
+// as used for new-energy plates).
+func plateColor(b byte) bool { return b <= 5 || b == 9 }
+
+// registrationLayout tells the 0x0100 layouts apart by length: 2019 (the
+// 2019 header), 2013 (manufacturer 5, model 20, terminal ID 7: 37 bytes
+// before the plate) or 2011 (model 8: 25 bytes before the plate). A body
+// of 37 bytes or more is 2013 unless its plate colour byte is not one
+// while the 2011 reading has one (a 2011 body with a long plate).
+func registrationLayout(b []byte, v2019 bool) string {
+	switch {
+	case v2019 && len(b) >= 76:
+		return "2019"
+	case v2019:
+		return ""
+	case len(b) >= 37 && (plateColor(b[36]) || !plateColor(b[24])):
+		return "2013"
+	case len(b) >= 25:
+		return "2011"
+	}
+	return ""
 }
 
 // authentication reads a 0x0102 body: the code, and in the 2019 form the

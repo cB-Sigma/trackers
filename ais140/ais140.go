@@ -31,7 +31,13 @@
 // kept their earlier layouts), is read by anchors: the latitude/longitude
 // pair, the 15-digit IMEI, the packet type code, and a date that is
 // DDMMYYYY, DDMMYY, split into six fields or joined with the time. A vendor
-// the anchors cannot read gets an explicit layout (profile fields).
+// the anchors cannot read gets an explicit layout (profile fields). After
+// the cells, the digital inputs and outputs are found wherever the
+// neighbour cells end, and what follows is read in the manufacturer's
+// layout (VendorTails: RLP's frame number, odometer, analog input,
+// accelerations and tilts; CTPL's frame number and odometer), picked from
+// the packet or the profile, or else as the frame number and analog
+// inputs. RLP devices' date and time before the fix flag are read too.
 //
 // The profile (NewCodec, ParseProfile; Profile):
 //
@@ -55,6 +61,8 @@
 //	loginSecretField: 0               # field number (1 = the first after '$') of a login password (0: none)
 //	healthFields: [batteryPercent, lowBatteryThreshold, memoryPercent, …]   # health packet fields after the IMEI
 //	namedCommands: {engineStop: "@SET#RLP,OP1,"}   # a manufacturer's own line for a named command
+//	vendor: ""                        # layout after the digital I/O: rlp | ctpl | standard ("" picks it from the packet)
+//	tail: [frame, odometerKm, analogInput1]   # or name that layout's fields ("-" skips one)
 //
 // healthFields names, in order, the fields that follow the IMEI in a
 // health (HLM) packet, for devices whose health packet differs from
@@ -139,7 +147,32 @@ type Profile struct {
 	// manufacturer's own, sent as it is: {"engineStop": "@SET#RLP,OP1,"}.
 	// Placeholders {seconds}, {password} and {imei}; "" turns one off.
 	NamedCommands track.NamedTemplates `json:"namedCommands,omitempty"`
+	// Vendor names a manufacturer's layout of the fields after the digital
+	// inputs and outputs (VendorTails: rlp, ctpl) for packets read by
+	// anchors; "" picks it from the packet (an RLP header, a CTPL vendor
+	// ID) or reads the common frame number and analog inputs; "standard"
+	// always reads those.
+	Vendor string `json:"vendor,omitempty"`
+	// Tail names the fields after the digital inputs and outputs in order
+	// ("-" skips one): frame, analogInput1, analogInput2, deltaDistance,
+	// odometerKm, accelX, accelY, accelZ, tiltX, tiltY. It overrides
+	// vendor.
+	Tail []string `json:"tail,omitempty"`
 }
+
+// VendorTails are the manufacturers' layouts of the fields after the
+// digital inputs and outputs, longest first; the first that the packet has
+// enough fields for is read. Layouts as Traccar's ITS decoder reads its
+// published packets (facts only).
+var VendorTails = map[string][][]string{
+	// RLP firmware 2.1.3 adds an analog input, three accelerations and two
+	// tilts to the frame number and odometer of 2.0.2 and 2.1.1.
+	"rlp":  {{"frame", "odometerKm", "analogInput1", "accelX", "accelY", "accelZ", "tiltY", "tiltX"}, {"frame", "odometerKm"}},
+	"ctpl": {{"frame", "odometerKm"}},
+}
+
+var tailNames = map[string]bool{"-": true, "frame": true, "analogInput1": true, "analogInput2": true, "deltaDistance": true,
+	"odometerKm": true, "accelX": true, "accelY": true, "accelZ": true, "tiltX": true, "tiltY": true}
 
 // Acks are reply templates per packet kind; empty sends nothing.
 type Acks struct {
@@ -193,6 +226,8 @@ type Config struct {
 	answers      bool
 	secretField  int
 	healthFields []string
+	vendor       string
+	tail         []string
 }
 
 // NewCodec validates a profile (empty for the defaults) and returns a
@@ -353,6 +388,21 @@ func ParseProfile(raw json.RawMessage) (*Config, error) {
 		return nil, err
 	}
 	c.named = p.NamedCommands
+	if _, ok := VendorTails[p.Vendor]; !ok && p.Vendor != "" && p.Vendor != "standard" {
+		return nil, fmt.Errorf("vendor %q is not one of rlp, ctpl or standard", p.Vendor)
+	}
+	c.vendor = p.Vendor
+	seen := map[string]bool{}
+	for _, f := range p.Tail {
+		if !tailNames[f] {
+			return nil, fmt.Errorf("tail: %q is not a known field name", f)
+		}
+		if f != "-" && seen[f] {
+			return nil, fmt.Errorf("tail: %q appears twice", f)
+		}
+		seen[f] = true
+	}
+	c.tail = p.Tail
 	return c, nil
 }
 
@@ -768,6 +818,9 @@ func (c *Config) auto(tok []string, kind string) map[string]string {
 		p["date"] = tok[a-6] + tok[a-5] + tok[a-4]
 		p["time"] = tok[a-3] + tok[a-2] + tok[a-1]
 		p["gpsFix"] = at(tok, a-7)
+	case fixFlag(at(tok, a-1)) && len(at(tok, a-2)) == 6 && isDigits(at(tok, a-2)) && (len(at(tok, a-3)) == 8 || len(at(tok, a-3)) == 6) && isDigits(at(tok, a-3)):
+		// The date and time before the fix flag (RLP).
+		p["date"], p["time"], p["gpsFix"] = tok[a-3], tok[a-2], tok[a-1]
 	}
 	e := a + 4
 	names := []string{"speed", "heading", "satellites", "altitude", "pdop", "hdop", "operator", "ignition", "mainPower", "mainVoltage", "batteryVoltage", "emergency"}
@@ -782,7 +835,79 @@ func (c *Config) auto(tok []string, kind string) map[string]string {
 	for i, n := range []string{"gsm", "mcc", "mnc", "lac", "cellId"} {
 		p[n] = at(tok, e+i)
 	}
+	c.tailFields(tok, e+5, p)
 	return p
+}
+
+func fixFlag(s string) bool { return s == "0" || s == "1" || s == "A" || s == "V" }
+
+// tailFields reads what follows the cells: the digital inputs (four of 0,
+// 1 or 2) and outputs (two of 0 or 1), wherever the neighbour cells end,
+// then the vendor's layout (profile tail, vendor, or one picked from the
+// packet), or else the frame number and analog inputs when they are
+// recognisable.
+func (c *Config) tailFields(tok []string, from int, p map[string]string) {
+	j := -1
+	for i := from; i+1 < len(tok); i++ {
+		if len(tok[i]) == 4 && strings.Trim(tok[i], "012") == "" && len(tok[i+1]) == 2 && strings.Trim(tok[i+1], "01") == "" {
+			j = i
+			break
+		}
+	}
+	if j < 0 {
+		return
+	}
+	p["digitalInputs"], p["digitalOutputs"] = tok[j], tok[j+1]
+	rest := tok[j+2:]
+	for len(rest) > 0 && rest[len(rest)-1] == "" {
+		rest = rest[:len(rest)-1]
+	}
+	layout := c.tail
+	if layout == nil {
+		v := c.vendor
+		if v == "" {
+			v = vendorOf(tok)
+		}
+		for _, l := range VendorTails[v] {
+			if len(rest) >= len(l) {
+				layout = l
+				break
+			}
+		}
+	}
+	if layout == nil {
+		switch {
+		case len(rest) > 0 && len(rest[0]) >= 5 && isDigits(rest[0]):
+			layout = []string{"frame", "analogInput1", "analogInput2", "deltaDistance"}
+		case len(rest) > 2 && strings.Contains(rest[0], ".") && strings.Contains(rest[1], ".") && isFloat(rest[0]) && isFloat(rest[1]) &&
+			len(rest[2]) >= 5 && isDigits(rest[2]):
+			layout = []string{"analogInput1", "analogInput2", "frame"}
+		}
+	}
+	for i, n := range layout {
+		if n != "-" && i < len(rest) {
+			p[n] = rest[i]
+		}
+	}
+}
+
+// vendorOf picks a vendor layout from the packet: an RLP header or a CTPL
+// vendor ID.
+func vendorOf(tok []string) string {
+	for i, t := range tok {
+		if i > 3 {
+			break
+		}
+		switch upper(t) {
+		case "RLP":
+			if i == 0 {
+				return "rlp"
+			}
+		case "CTPL":
+			return "ctpl"
+		}
+	}
+	return ""
 }
 
 // explicit reads a normal packet by the configured layout.
@@ -1102,10 +1227,14 @@ func (c *Config) status(p map[string]string, st map[string]any) {
 			st[k] = b
 		}
 	}
-	for _, k := range []string{"mainVoltage", "batteryVoltage", "pdop", "hdop", "analogInput1", "analogInput2", "deltaDistance"} {
+	for _, k := range []string{"mainVoltage", "batteryVoltage", "pdop", "hdop", "analogInput1", "analogInput2", "deltaDistance",
+		"accelX", "accelY", "accelZ", "tiltX", "tiltY"} {
 		if v, ok := num(p[k]); ok {
 			st[k] = v
 		}
+	}
+	if v, ok := num(p["odometerKm"]); ok {
+		st["odometer"] = math.Round(v * 1000)
 	}
 	if v, ok := num(p["gsm"]); ok {
 		st["gsm"] = int(v)

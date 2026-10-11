@@ -38,10 +38,21 @@
 // GTIOB, GTANT, GTIDN/GTIDF, GTSTR/GTSTP/GTLSP, GTGSS, GTFLA, GTDOS, GTAIS,
 // GTIDA). Other configuration and data reports are accepted without
 // values; a report this package does not know is passed over with the
-// warning queclink.unknownMessage. The HEX (binary) report format
-// (+RSP/+EVT/+INF/+HBD headers, AT+GTSRI <Protocol Format> 1) is not read:
-// such frames are passed over with queclink.unknownCodec; set the device's
-// protocol format to ASCII.
+// warning queclink.unknownMessage.
+//
+// The HEX (binary) format (AT+GTSRI or AT+GTQSS <Protocol Format> 1) is
+// read on the same connection, told apart by its header: +RSP/+BSP
+// location reports, +EVT/+BVT event reports (B: from the buffer, history),
+// +INF/+BNF information reports, +HBD heartbeats (answered with the ASCII
+// +SACK:GTHBD) and +ACK command acknowledgements (correlated like the
+// ASCII ones), with the items AT+GTHRM's masks select; see hex.go. A HEX
+// frame that names the device by its device name is read when an earlier
+// frame on the connection gave the IMEI. The GV300N's factory masks name
+// the device by its device name; clear those bits so that every frame
+// carries the IMEI, for example
+// AT+GTHRM=<password>,,,6F,3FEFFBF,3FEFFBF,FF7D,EF,,,,,,0001$. Crash data (+CRD), +DAT and +CAN
+// frames are passed over with queclink.unknownMessage, a HEX frame that
+// does not decode with queclink.messageUnreadable.
 //
 // Commands are AT+GTxxx=<password>,…,<serial>$. The raw form
 // {"text": "AT+GTRTO=gv300,1,,,,,,0001$"} is sent as written (a missing
@@ -180,6 +191,7 @@ type codec struct {
 	cfg  *config
 	base uint32
 	seen bool
+	imei string // the connection's device, for HEX frames that carry its name
 }
 
 const maxFrame = 16 << 10
@@ -200,7 +212,14 @@ func (c *codec) Decode(r *bufio.Reader) (*track.Message, error) {
 	h := string(head)
 	switch {
 	case strings.HasPrefix(h, "RESP:"), strings.HasPrefix(h, "BUFF:"), strings.HasPrefix(h, "ACK:"):
-	case len(h) >= 4 && isUpper(h[:3]) && h[3] != ':' || len(h) >= 4 && h[:3] == "ACK" && h[3] != ':':
+	case len(h) >= 1 && h[0] == 0, len(h) >= 4 && hexHeaders[h[:3]] && h[3] != ':':
+		frame, err := readHex(r)
+		if err != nil {
+			return nil, err
+		}
+		m, err := c.parseHex(frame)
+		return c.identified(m, err)
+	case len(h) >= 4 && isUpper(h[:3]) && h[3] != ':':
 		return nil, c.skipBinary(r, h[:3])
 	default:
 		return nil, track.ErrSkip
@@ -223,10 +242,18 @@ func (c *codec) Decode(r *bufio.Reader) (*track.Message, error) {
 		}
 		return nil, err
 	}
-	m, err := c.parse(strings.TrimSuffix(string(buf), "$"))
-	if err == nil && m != nil && !c.seen && m.IMEI != "" {
-		c.seen = true
-		m.Login = true
+	return c.identified(c.parse(strings.TrimSuffix(string(buf), "$")))
+}
+
+// identified marks the connection's first frame with an IMEI as its login
+// and keeps the IMEI for HEX frames that carry the device name.
+func (c *codec) identified(m *track.Message, err error) (*track.Message, error) {
+	if err == nil && m != nil && m.IMEI != "" {
+		if !c.seen {
+			c.seen = true
+			m.Login = true
+		}
+		c.imei = m.IMEI
 	}
 	return m, err
 }
@@ -240,7 +267,8 @@ func isUpper(s string) bool {
 	return s != ""
 }
 
-// skipBinary passes over a HEX-format report: it ends with 0x0D 0x0A.
+// skipBinary passes over a binary frame of a header this codec does not
+// know: it ends with 0x0D 0x0A.
 func (c *codec) skipBinary(r *bufio.Reader, header string) error {
 	n := 0
 	prev := byte(0)
@@ -256,7 +284,7 @@ func (c *codec) skipBinary(r *bufio.Reader, header string) error {
 		prev = b
 	}
 	return &track.Skip{Warning: track.Warning{Code: "unknownCodec", Detail: "+" + header,
-		Msg: "A Queclink report in the HEX (binary) format was passed over: this codec reads the ASCII format. Set the device's protocol format to ASCII (<Protocol Format> 0 in AT+GTSRI or AT+GTQSS)."}}
+		Msg: "A Queclink binary frame with a header this codec does not know was passed over."}}
 }
 
 func unknown(text string) error {
