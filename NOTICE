@@ -1,0 +1,90 @@
+trackers (GPS tracker protocols and AIS-140, in Go)
+Copyright 2026 Abhinav Gautam
+
+This module is licensed under the Apache License, Version 2.0 (LICENSE).
+
+The code was written for SigmaM2M from the published protocol documents
+listed in PROVENANCE.md. It contains no code from other projects. The
+source files that come from SigmaM2M carry no per-file copyright header
+(the convention of the code they come from); the copyright line above
+covers them. Files added for this module carry "Copyright 2026 Abhinav
+Gautam" and "SPDX-License-Identifier: Apache-2.0".
+
+Traccar
+-------
+
+Traccar (https://github.com/traccar/traccar)
+Copyright Anton Tananaev and Traccar contributors
+Licensed under the Apache License, Version 2.0.
+
+No Traccar source code is included. Traccar was used in two ways:
+
+1. Test data. Device packets published in Traccar's protocol decoder tests
+   (src/test/java/org/traccar/protocol) are used, as protocol facts, as
+   test vectors in these files:
+   - gt06/gt06_test.go: GT06/Concox frames, also quoted in the protocol
+     documents.
+   - gt06/lbs_test.go: GT06/Concox cell (LBS) and WiFi frames from the GT06
+     tests; gt06/lbs.go's frame layouts were checked against them.
+   - jt808/decode_test.go: the JT/T 808 frames of the vRegister2013 to
+     vRegister2019 block (2013 and 2019 registration, authentication,
+     location, locate answer, batch and blind-area uploads, a 0x6006 text
+     answer), from Jt808ProtocolDecoderTest.
+   - h02/decode_test.go: H02 binary records bDoc, bText and b45.
+   - ruptela/ruptela_test.go: Ruptela packets devRecords, devIdent,
+     devGetio and devExt.
+   - ais140/ais140_test.go: AIS-140 packets of several manufacturers
+     (fieldVectors).
+   - osmand/decode_test.go: OsmAnd sample requests and older Traccar
+     Client JSON bodies (OsmAndProtocolDecoderTest).
+
+2. Reference reading for behaviour, without taking code: the H02 decoder
+   and encoder, the JT808 decoder and encoder ("huabao"), the OsmAnd
+   decoder, and the Position and Device models whose JSON field names a
+   Traccar server's position forwarding carries (osmand/json.go reads
+   them). PROVENANCE.md says what was taken from each.
+
+Traccar's web site also hosts manufacturers' protocol documents
+(traccar.org/protocol/...); those are the manufacturers' documents, cited
+in PROVENANCE.md, not Traccar's work.
+
+Traccar Client
+--------------
+
+Traccar Client (https://github.com/traccar/traccar-client)
+Copyright Anton Tananaev
+Licensed under the Apache License, Version 2.0.
+
+Traccar Client SDK (https://github.com/traccar/traccar-client-sdk)
+Copyright 2024 Anton Tananaev
+Licensed under the Apache License, Version 2.0.
+
+Both were read for the request forms a phone sends (the form POST and its
+parameters, the SOS alarm); no code was taken.
+
+Dependencies
+------------
+
+The Go standard library only.
+
+Test data
+---------
+
+Apart from the Traccar test vectors above and the sample frames of the
+manufacturers' documents (protocol facts, see PROVENANCE.md), every IMEI,
+ICCID, phone number, password, position and device ID in the tests and
+the examples is a made-up demo value. The AIS-140 tests use packets of
+our own in the standard's field layouts, not the standard's samples.
+
+Trademarks
+----------
+
+Concox, Jimi IoT, Teltonika, Queclink, Meitrack, Ruptela, HuaSunTeK,
+Cantrack, Sinotrack, Coban, Traccar and OsmAnd are trademarks or names of
+their owners. They are used here only to say which devices, protocols and
+software this code works with. AIS-140 is a standard published by ARAI
+(Automotive Research Association of India) under the Ministry of Road
+Transport and Highways (MoRTH), Government of India; JT/T 808 is a
+standard of the Ministry of Transport of the People's Republic of China.
+This project is not affiliated with, sponsored or endorsed by any of these
+companies, projects or bodies.
